@@ -4,5 +4,5 @@
 
 [[redirects]]
   from = "/api/chat"
-  to = "/.netlify/functions/chat"
+  to = "/.netlify/functions/ask"
   status = 200
