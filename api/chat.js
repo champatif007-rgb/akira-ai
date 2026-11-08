@@ -24,20 +24,43 @@ function rules(b) {
 
 module.exports = async (req, res) => {
   const out = (code, obj) => res.status(code).json(obj);
-  if (req.method !== "POST") return out(405, { error: "post_only" });
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return out(500, { error: "not_configured" });
-
-  let b = req.body;
-  if (typeof b === "string") { try { b = JSON.parse(b); } catch { return out(400, { error: "bad_json" }); } }
-  if (!b || typeof b !== "object") return out(400, { error: "bad_json" });
-  if (JSON.stringify(b).length > 40000) return out(413, { error: "too_big" });
+  // Clean the key: removes accidental spaces, line breaks or quotes
+  const key = String(process.env.GEMINI_API_KEY || "").trim().replace(/^["']+|["']+$/g, "").trim();
+  const model = (process.env.GEMINI_MODEL || "gemini-flash-latest").trim();
 
   const ip = String(req.headers["x-forwarded-for"] || "x").split(",")[0].trim();
   const now = Date.now();
   const recent = (hits.get(ip) || []).filter((t) => now - t < 60000);
   if (recent.length >= 10) return out(429, { error: "rate" });
   recent.push(now); hits.set(ip, recent);
+
+  // Health check: open /api/chat?test=1 in the browser to see what Google says
+  if (req.method === "GET" && req.query && req.query.test) {
+    const info = { key_found: !!key, key_length: key.length, key_prefix: key.slice(0, 3), model };
+    if (!key) return out(200, Object.assign(info, { problem: "GEMINI_API_KEY is missing in Vercel. Add it, then redeploy." }));
+    try {
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Say hi in one word." }] }], generationConfig: { maxOutputTokens: 20 } }),
+      });
+      const j = await r.json();
+      info.google_status = r.status;
+      info.google_message = r.ok ? "OK - the key and model work" : String((j.error && j.error.message) || JSON.stringify(j)).slice(0, 300);
+      return out(200, info);
+    } catch (e) {
+      info.google_message = "Could not reach Google: " + String(e.message || e).slice(0, 200);
+      return out(200, info);
+    }
+  }
+
+  if (req.method !== "POST") return out(405, { error: "post_only" });
+  if (!key) return out(500, { error: "not_configured" });
+
+  let b = req.body;
+  if (typeof b === "string") { try { b = JSON.parse(b); } catch { return out(400, { error: "bad_json" }); } }
+  if (!b || typeof b !== "object") return out(400, { error: "bad_json" });
+  if (JSON.stringify(b).length > 40000) return out(413, { error: "too_big" });
 
   b.mode = MODES[b.mode] ? b.mode : "help";
   b.grade = GRADES.includes(b.grade) ? b.grade : GRADES[2];
@@ -49,7 +72,6 @@ module.exports = async (req, res) => {
   while (msgs.length && msgs[0].role !== "user") msgs.shift();
   if (!msgs.length || msgs[msgs.length - 1].role !== "user") return out(400, { error: "no_question" });
 
-  const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
   const safety = ["HARASSMENT", "HATE_SPEECH", "SEXUALLY_EXPLICIT", "DANGEROUS_CONTENT"].map((c) => ({ category: "HARM_CATEGORY_" + c, threshold: "BLOCK_MEDIUM_AND_ABOVE" }));
   try {
     const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
@@ -58,11 +80,15 @@ module.exports = async (req, res) => {
       body: JSON.stringify({ systemInstruction: { parts: [{ text: rules(b) }] }, contents: msgs, safetySettings: safety, generationConfig: { temperature: 0.6, maxOutputTokens: 2500 } }),
     });
     const j = await r.json();
-    if (!r.ok) return out(r.status === 429 ? 429 : 502, { error: r.status === 404 ? "model" : "upstream" });
+    if (!r.ok) {
+      console.log("Gemini error", r.status, JSON.stringify(j).slice(0, 300));
+      return out(r.status === 429 ? 429 : 502, { error: r.status === 404 ? "model" : "upstream" });
+    }
     const parts = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts;
     const text = parts ? parts.map((p) => p.text || "").join("") : "";
     return out(200, { text: text || "", blocked: !text });
   } catch (e) {
+    console.log("Fetch error", String(e.message || e));
     return out(502, { error: "upstream" });
   }
 };
